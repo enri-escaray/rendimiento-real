@@ -2,12 +2,19 @@
  * Almacén del último snapshot de datos.
  *
  * Estrategia de lectura (de más fresco a más resiliente):
- *   1. Caché en memoria del proceso (rápida, se pierde entre despliegues).
+ *   1. Caché en memoria del proceso, con TTL corto (rápida; se pierde entre
+ *      despliegues y cada TTL se revalida contra Neon).
  *   2. Base de datos Neon, si hay DATABASE_URL configurada (persistente).
  *   3. Snapshot semilla estático (siempre disponible).
  *
  * La calculadora nunca llama a las APIs externas: siempre lee de acá. La
  * escritura la hace el cron (construirSnapshot → guardarSnapshot).
+ *
+ * Sobre el TTL: en serverless (Vercel) conviven varias instancias "calientes",
+ * y el cron solo actualiza la memoria de la instancia donde corre. Sin TTL, otra
+ * instancia caliente seguiría sirviendo el snapshot viejo hasta reciclarse. Con
+ * un TTL corto, cada instancia re-lee de Neon pasado ese tiempo y toma el dato
+ * fresco que dejó el cron, sin dejar de ser rápida en el uso normal.
  *
  * Neon "duerme y se despierta solo" ante la primera consulta (cold start < 1s),
  * sin intervención humana, y el propio cron diario lo mantiene tibio
@@ -17,7 +24,20 @@
 import type { SnapshotDatos } from "@/lib/apis/types";
 import { SNAPSHOT_SEED } from "./seed";
 
+/** Vigencia de la caché en memoria antes de revalidar contra Neon. */
+const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutos
+
 let cacheMemoria: SnapshotDatos | null = null;
+let cacheMemoriaTs = 0;
+
+function cacheVigente(): boolean {
+  return cacheMemoria !== null && Date.now() - cacheMemoriaTs < CACHE_TTL_MS;
+}
+
+function guardarEnMemoria(snapshot: SnapshotDatos): void {
+  cacheMemoria = snapshot;
+  cacheMemoriaTs = Date.now();
+}
 
 function tieneNeon(): boolean {
   return typeof process.env.DATABASE_URL === "string" && process.env.DATABASE_URL.length > 0;
@@ -71,14 +91,17 @@ async function escribirEnNeon(snapshot: SnapshotDatos): Promise<void> {
  * semilla, de modo que la UI siempre tiene datos con los que trabajar.
  */
 export async function leerSnapshot(): Promise<SnapshotDatos> {
-  if (cacheMemoria) return cacheMemoria;
+  if (cacheVigente()) return cacheMemoria!;
   if (tieneNeon()) {
     const deNeon = await leerDeNeon();
     if (deNeon) {
-      cacheMemoria = deNeon;
+      guardarEnMemoria(deNeon);
       return deNeon;
     }
   }
+  // Neon falló o no está configurada: si teníamos un dato en memoria (aunque
+  // esté vencido), es preferible servir ese último dato válido que la semilla.
+  if (cacheMemoria) return cacheMemoria;
   return SNAPSHOT_SEED;
 }
 
@@ -88,7 +111,7 @@ export async function leerSnapshot(): Promise<SnapshotDatos> {
  * el error para que el cron lo registre.
  */
 export async function guardarSnapshot(snapshot: SnapshotDatos): Promise<void> {
-  cacheMemoria = snapshot;
+  guardarEnMemoria(snapshot);
   if (tieneNeon()) {
     await escribirEnNeon(snapshot);
   }
